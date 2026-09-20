@@ -12,6 +12,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator
 
+from .genealogy import (
+    BatchGenealogyError,
+    GenealogyGraphError,
+    InsufficientStockError,
+    genealogy,
+)
 from .gs1 import GS1ParseError, parse
 from .pickplan import DemandValidationError, pick_plan
 from .recall import ItemConflictError, RuleValidationError, assess
@@ -20,7 +26,7 @@ from .traceaudit import EventConflictError, TraceAuditError, audit
 
 app = FastAPI(
     title="GS1 Element String Parser",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "Parses GS1 input into structured, ordered AI elements. Accepts raw "
         "scan strings (FNC1 / ASCII 29 separated) and GS1 Digital Link URIs "
@@ -63,7 +69,24 @@ app = FastAPI(
         "item conflicting on batch or expiry are rejected with the current "
         "and first event indices. The response keeps the event order and "
         "reports the state before/after each event plus its anomaly, and "
-        "summarises the items by final state."
+        "summarises the items by final state. POST /batch-genealogy "
+        "audits a production batch genealogy over opening batch stock "
+        "and transformation processes given in arbitrary order: every "
+        "material scan (opening stock, process input or output) carries "
+        "exactly one AI 01, exactly one AI 10 and one weight AI; batches "
+        "are identified by GTIN + lot and aggregated with exact Decimal "
+        "arithmetic in the target unit. A batch may be produced by at "
+        "most one process, every consumed batch must come from the "
+        "opening stock or a process output, and the producer/consumer "
+        "dependency graph must be acyclic -- violations reject the whole "
+        "request with 422 naming the process index. The processes then "
+        "run in a stable topological order (the lowest request index "
+        "first among the ready ones), deducting inputs and adding "
+        "outputs; any process consuming more than the available balance "
+        "rejects the whole request. The response lists the processes in "
+        "that stable order with per-batch inputs/outputs and "
+        "input/output/loss weights, plus the final balance of every "
+        "batch."
     ),
 )
 
@@ -81,7 +104,7 @@ class ParseRequest(BaseModel):
             "path and query string."
         ),
         examples=[
-            "01095011015300031725013110ABC12321SN0001",
+            "01095011015300031725013110ABC123\x1d21SN0001",
             "https://id.gs1.org/01/09501101530003/17/250131?10=ABC123&21=SN0001",
         ],
     )
@@ -123,8 +146,8 @@ class WeightSummaryRequest(BaseModel):
         ),
         examples=[
             [
-                "010950110153000310B13103002513",
-                "010950110153000310B13202002513",
+                "010950110153000310B1\x1d3103002513",
+                "010950110153000310B1\x1d3202002513",
             ]
         ],
     )
@@ -500,6 +523,114 @@ class TraceAuditResponse(BaseModel):
     summary: TraceStateSummary
 
 
+class GenealogyProcess(BaseModel):
+    """One transformation process: inputs are consumed, outputs produced."""
+
+    inputs: list[str] = Field(
+        ...,
+        description=(
+            "Raw GS1 scan strings and/or GS1 Digital Link URIs of the "
+            "materials the process consumes. Each must contain exactly one "
+            "AI 01, exactly one AI 10 and exactly one weight AI 310n/320n."
+        ),
+        examples=[["010950110153000310R1\x1d3103006000"]],
+    )
+    outputs: list[str] = Field(
+        ...,
+        description=(
+            "Raw GS1 scan strings and/or GS1 Digital Link URIs of the "
+            "materials the process produces; same per-scan shape as inputs."
+        ),
+        examples=[["010000000000001710P1\x1d3103005500"]],
+    )
+
+
+class BatchGenealogyRequest(BaseModel):
+    target_unit: Literal["kg", "lb"] = Field(
+        default="kg",
+        description='Unit of every weight in the response: "kg" or "lb" (default "kg").',
+    )
+    opening_stock: list[str] = Field(
+        ...,
+        description=(
+            "Opening batch inventory: raw GS1 scan strings and/or GS1 "
+            "Digital Link URIs, one per material scan. Each must contain "
+            "exactly one AI 01, exactly one AI 10 and exactly one weight "
+            "AI 310n/320n; scans of one batch are aggregated."
+        ),
+        examples=[["010950110153000310R1\x1d3103010000"]],
+    )
+    processes: list[GenealogyProcess] = Field(
+        ...,
+        description=(
+            "Transformation processes in arbitrary order; the audit "
+            "derives their execution order from the producer/consumer "
+            "dependency graph."
+        ),
+        examples=[
+            [
+                {
+                    "inputs": ["010950110153000310R1\x1d3103006000"],
+                    "outputs": ["010000000000001710P1\x1d3103005500"],
+                }
+            ]
+        ],
+    )
+
+
+class BatchWeight(BaseModel):
+    """OpenAPI shape of one per-batch weight; rendered as an exact JSON number."""
+
+    gtin: str = Field(description="AI 01 GTIN-14 of the batch")
+    batch: str = Field(description="AI 10 batch/lot of the batch")
+    weight: float = Field(
+        description=(
+            "Net weight in the target unit, rounded to six decimal places "
+            "with round-half-even. Computed internally with Decimal, never "
+            "float."
+        )
+    )
+
+
+class GenealogyProcessResult(BaseModel):
+    """OpenAPI shape of one executed process; weights render as exact JSON numbers."""
+
+    process_index: int = Field(description="Position of the process in the request")
+    inputs: list[BatchWeight] = Field(
+        description="Consumed weights per batch, in first-seen order within the process"
+    )
+    outputs: list[BatchWeight] = Field(
+        description="Produced weights per batch, in first-seen order within the process"
+    )
+    input_weight: float = Field(description="Total consumed weight (six decimal places)")
+    output_weight: float = Field(description="Total produced weight (six decimal places)")
+    loss_weight: float = Field(
+        description=(
+            "input_weight - output_weight; negative when the process yields "
+            "more than it consumes (six decimal places)"
+        )
+    )
+
+
+class BatchBalance(BaseModel):
+    """OpenAPI shape of one batch's final balance; weights render as exact JSON numbers."""
+
+    gtin: str = Field(description="AI 01 GTIN-14 of the batch")
+    batch: str = Field(description="AI 10 batch/lot of the batch")
+    opening: float = Field(description="Opening stock weight (six decimal places)")
+    produced: float = Field(description="Total weight produced by the processes")
+    consumed: float = Field(description="Total weight consumed by the processes")
+    remaining: float = Field(
+        description="Final balance: opening + produced - consumed (six decimal places)"
+    )
+
+
+class BatchGenealogyResponse(BaseModel):
+    target_unit: Literal["kg", "lb"]
+    processes: list[GenealogyProcessResult]
+    batches: list[BatchBalance]
+
+
 SIX_PLACES = Decimal("0.000001")
 
 
@@ -619,6 +750,44 @@ def _build_recall_response(result: dict) -> Response:
     return Response(content=_dump(payload), media_type="application/json")
 
 
+def _build_genealogy_response(result: dict) -> Response:
+    """Quantize every weight half-even to six places and render exact JSON."""
+
+    def batch_weight(entry: dict) -> dict:
+        return {
+            "gtin": entry["gtin"],
+            "batch": entry["batch"],
+            "weight": _six(entry["weight"]),
+        }
+
+    payload = {
+        "target_unit": result["target_unit"],
+        "processes": [
+            {
+                "process_index": process["process_index"],
+                "inputs": [batch_weight(entry) for entry in process["inputs"]],
+                "outputs": [batch_weight(entry) for entry in process["outputs"]],
+                "input_weight": _six(process["input_weight"]),
+                "output_weight": _six(process["output_weight"]),
+                "loss_weight": _six(process["loss_weight"]),
+            }
+            for process in result["processes"]
+        ],
+        "batches": [
+            {
+                "gtin": batch["gtin"],
+                "batch": batch["batch"],
+                "opening": _six(batch["opening"]),
+                "produced": _six(batch["produced"]),
+                "consumed": _six(batch["consumed"]),
+                "remaining": _six(batch["remaining"]),
+            }
+            for batch in result["batches"]
+        ],
+    }
+    return Response(content=_dump(payload), media_type="application/json")
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -694,3 +863,23 @@ def trace_audit(req: TraceAuditRequest) -> TraceAuditResponse:
     except (TraceAuditError, EventConflictError) as exc:
         raise HTTPException(status_code=422, detail=exc.detail) from exc
     return TraceAuditResponse(**result)
+
+
+@app.post(
+    "/batch-genealogy",
+    response_model=BatchGenealogyResponse,
+)
+def batch_genealogy(req: BatchGenealogyRequest) -> Response:
+    try:
+        result = genealogy(
+            req.opening_stock,
+            req.target_unit,
+            [(process.inputs, process.outputs) for process in req.processes],
+        )
+    except (
+        BatchGenealogyError,
+        GenealogyGraphError,
+        InsufficientStockError,
+    ) as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
+    return _build_genealogy_response(result)

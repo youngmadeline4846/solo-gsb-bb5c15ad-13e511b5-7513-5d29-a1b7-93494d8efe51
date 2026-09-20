@@ -691,6 +691,156 @@ curl -X POST http://localhost:8080/trace-audit \
 }
 ```
 
+## 生产批次谱系审计 `POST /batch-genealogy`
+
+一次提交**期初批次库存**和一组**顺序任意**的转换工序，按 **GTIN + 批号（AI 01 + AI 10）**
+标识批次：先校验生产/消耗依赖图，再按**稳定拓扑序**逐步扣减库存，返回工序谱系、各工序
+投入/产出/损耗重量与全部批次的最终余量。
+
+- 请求体：`{"opening_stock": [...], "processes": [{"inputs": [...], "outputs": [...]}], "target_unit": "kg"}`。
+  `target_unit` 可选，仅接受 `"kg"` / `"lb"`，默认 `"kg"`；`opening_stock` 为期初库存
+  扫码数组；`processes` 为工序数组（顺序任意），每道工序含 `inputs`（消耗）与
+  `outputs`（产出）两个扫码数组（字段必填，可为空数组）。所有扫码值既可以是元素串，
+  也可以是 GS1 Digital Link URI（与 `/parse` 完全一致）。
+- 每条扫码必须包含**恰好一个 AI 01**、**恰好一个 AI 10**（批号必填——批次由
+  GTIN+批号标识）和**恰好一个重量 AI**（310n 或 320n，允许混合千克/磅）；AI 17/21
+  会被忽略。任一条扫码解析失败或缺少/重复必需 AI，整个请求返回 `422`：期初库存出错时
+  `detail.scan_index` 给出下标；工序扫码出错时 `detail.process_index` 给出工序下标，
+  并以 `detail.input_index` / `detail.output_index` 给出工序内下标；`detail.error`
+  为该条扫码的原始错误（结构同 `/parse`）。
+- 重量一律使用 `Decimal` 从**原始六位数字与精度位 n** 重建，按固定系数
+  **1 lb = 0.45359237 kg** 换算到 `target_unit` 后按 **GTIN+批号** 聚合：期初库存
+  聚合一次，每道工序的投入、产出分别聚合。
+- 依赖图校验（在扣减任何库存之前；出错均整单返回 `422` 并携带工序下标）：
+  - **一批多产**：同一批次最多由一道工序产出。第二道产出该批次的工序使整单失败，
+    `detail.process_index` 为当前工序、`detail.first_index` 为首次产出的工序
+    （错误码 `MULTIPLE_PRODUCERS`）。
+  - **无来源批次**：工序消耗的批次必须来自期初库存或某道工序的产出，否则整单失败，
+    `detail.process_index` 定位出错工序（错误码 `UNKNOWN_BATCH`）。
+  - **循环依赖**：工序消耗另一工序产出的批次即构成依赖边，依赖图必须无环（工序
+    消耗自身产出也算长度为 1 的环）。检测到环时整单失败，`detail.process_index`
+    与 `detail.cycle` 给出环上的工序下标（错误码 `CYCLE_DETECTED`）。
+- 库存扣减：按**稳定拓扑序**执行工序——在所有投入均已就绪的工序中，**请求下标最小
+  者先执行**；每道工序先按批次扣减投入、再记入产出。任一道工序对某批次的投入超过
+  当前可用余量（超耗）时整单返回 `422`，`detail.process_index` 定位出错工序（错误码
+  `INSUFFICIENT_STOCK`）。同一批次既在期初库存又由工序产出时，数量累加。
+- 响应：`target_unit`、`processes` 与 `batches`。`processes` 按**稳定拓扑序**排列，
+  每项含 `process_index`（请求中的下标）、按批次聚合的 `inputs` / `outputs`（各含
+  `gtin`、`batch`、`weight`，批次按工序内首次出现排序）以及 `input_weight` /
+  `output_weight` / `loss_weight`（损耗 = 投入 − 产出，产出大于投入时为负）。
+  `batches` 按首次出现顺序（期初库存在前，其后按请求顺序各工序的产出）给出全部批次的
+  `opening` / `produced` / `consumed` / `remaining` 重量。所有重量全程 `Decimal`
+  计算，仅在响应时按**六位小数 half-even（银行家舍入）**输出为 JSON 数字
+  （如 `2.513000`）。
+- `opening_stock` 与 `processes` 均为空数组时返回 `200` 与空的 `processes` / `batches`。
+
+请求示例（10 kg 原料批次 `R1`；工序 1 消耗 6 kg `R1` 产出 5.5 kg 成品批次 `P1`，
+工序 0 再消耗 2 kg `P1` 产出 1.9 kg 批次 `P2`——请求中工序顺序颠倒，仍按拓扑序执行）：
+
+```bash
+curl -X POST http://localhost:8080/batch-genealogy \
+  -H "Content-Type: application/json" \
+  -d '{"opening_stock": ["010950110153000310R1\u001d3103010000"], "processes": [{"inputs": ["010000000000001710P1\u001d3103002000"], "outputs": ["010000000000001710P2\u001d3103001900"]}, {"inputs": ["010950110153000310R1\u001d3103006000"], "outputs": ["010000000000001710P1\u001d3103005500"]}]}'
+```
+
+响应 `200 OK`：`processes` 按稳定拓扑序排列（工序 1 先于工序 0），`batches` 给出
+三个批次的最终余量（`R1` 余 4 kg、`P1` 余 3.5 kg、`P2` 余 1.9 kg）：
+
+```json
+{
+  "target_unit": "kg",
+  "processes": [
+    {
+      "process_index": 1,
+      "inputs": [{"gtin": "09501101530003", "batch": "R1", "weight": 6.000000}],
+      "outputs": [{"gtin": "00000000000017", "batch": "P1", "weight": 5.500000}],
+      "input_weight": 6.000000,
+      "output_weight": 5.500000,
+      "loss_weight": 0.500000
+    },
+    {
+      "process_index": 0,
+      "inputs": [{"gtin": "00000000000017", "batch": "P1", "weight": 2.000000}],
+      "outputs": [{"gtin": "00000000000017", "batch": "P2", "weight": 1.900000}],
+      "input_weight": 2.000000,
+      "output_weight": 1.900000,
+      "loss_weight": 0.100000
+    }
+  ],
+  "batches": [
+    {"gtin": "09501101530003", "batch": "R1", "opening": 10.000000, "produced": 0.000000, "consumed": 6.000000, "remaining": 4.000000},
+    {"gtin": "00000000000017", "batch": "P2", "opening": 0.000000, "produced": 1.900000, "consumed": 0.000000, "remaining": 1.900000},
+    {"gtin": "00000000000017", "batch": "P1", "opening": 0.000000, "produced": 5.500000, "consumed": 2.000000, "remaining": 3.500000}
+  ]
+}
+```
+
+同一批次由两道工序产出时返回 `422`（当前工序下标与首次产出下标一并给出）：
+
+```json
+{
+  "detail": {
+    "process_index": 1,
+    "first_index": 0,
+    "error": {
+      "error": "MULTIPLE_PRODUCERS",
+      "message": "process 1: batch GTIN '00000000000017' batch 'P1' is already produced by process 0; each batch may be produced by at most one process",
+      "expected": "batch produced only by process 0",
+      "found": "second producer at process 1"
+    }
+  }
+}
+```
+
+消耗无来源批次（既不在期初库存也不由任何工序产出）时返回 `422`：
+
+```json
+{
+  "detail": {
+    "process_index": 0,
+    "error": {
+      "error": "UNKNOWN_BATCH",
+      "message": "process 0: input batch GTIN '09501101530003' batch 'ZZ' has no source: it is neither in the opening stock nor produced by any process",
+      "expected": "input batch present in opening_stock or produced by exactly one process",
+      "found": "GTIN '09501101530003' batch 'ZZ'"
+    }
+  }
+}
+```
+
+依赖成环时返回 `422`，`cycle` 给出环上的工序下标：
+
+```json
+{
+  "detail": {
+    "process_index": 0,
+    "cycle": [0, 1],
+    "error": {
+      "error": "CYCLE_DETECTED",
+      "message": "processes 0 -> 1 -> 0 form a production/consumption dependency cycle; the graph must be acyclic",
+      "expected": "an acyclic producer/consumer dependency graph",
+      "found": "cycle 0 -> 1 -> 0"
+    }
+  }
+}
+```
+
+某道工序超耗（投入超过当前可用余量）时返回 `422`，需求量与可用量一并给出：
+
+```json
+{
+  "detail": {
+    "process_index": 0,
+    "error": {
+      "error": "INSUFFICIENT_STOCK",
+      "message": "process 0: batch GTIN '09501101530003' batch 'R1' requires 6.000000 kg but only 4.000000 kg is available",
+      "expected": "at most 4.000000 kg of batch GTIN '09501101530003' batch 'R1'",
+      "found": "6.000000 kg"
+    }
+  }
+}
+```
+
 ## 错误响应
 
 解析或校验失败返回 `422 Unprocessable Entity`，`detail` 中包含错误码、
@@ -745,18 +895,20 @@ uvicorn app.main:app --reload --port 8080
 
 ```
 app/
-  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan、/recall-impact、/trace-audit）
+  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan、/recall-impact、/trace-audit、/batch-genealogy）
   gs1.py      # GS1 元素串 / Digital Link URI 解析与校验核心
   summary.py  # 多扫描重量汇总：Decimal 重建、单位换算、GTIN+批号分组
   pickplan.py # FEFO 拣货计划：GTIN+批号+效期汇总、as_of+min_remaining_days 效期门槛、按实际效期分配需求；whole 整包模式按单条扫描做最小超量子集选择
   recall.py   # 召回范围盘点：GTIN+序列号实物去重与冲突检测、有序规则（GTIN+批号集合+效期闭区间）首命中归组、未命中汇总
   traceaudit.py # 追溯事件审计：GTIN+序列号实物识别、批号/效期一致性校验、receive→pick→ship 状态机与异常记录、最终状态汇总
+  genealogy.py # 生产批次谱系审计：GTIN+批号批次台账、一批一产/无来源/循环依赖图校验、稳定拓扑序库存扣减与超耗拒绝、批次最终余量
 tests/
   test_parse.py
   test_weight_summary.py
   test_weight_pick_plan.py
   test_recall_impact.py
   test_trace_audit.py
+  test_batch_genealogy.py
 Dockerfile
 docker-compose.yml
 requirements.txt      # 运行依赖
