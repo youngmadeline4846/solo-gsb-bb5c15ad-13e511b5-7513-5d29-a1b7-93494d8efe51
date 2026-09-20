@@ -691,6 +691,151 @@ curl -X POST http://localhost:8080/trace-audit \
 }
 ```
 
+## 生产批次谱系审计 `POST /batch-genealogy`
+
+一次提交**期初批次库存**和一组**顺序任意**的转换工序，按 **GTIN + 批号（AI 01 +
+AI 10）** 标识批次：先校验生产/消耗依赖图，再按**稳定拓扑序**逐步扣减库存，返回
+工序谱系、各工序投入/产出/损耗重量与全部批次的最终余量。
+
+- 请求体：`{"opening_stock": [...], "processes": [{"inputs": [...], "outputs": [...]}], "target_unit": "kg"}`。
+  `opening_stock` 为期初库存扫码数组；`processes` 为工序数组，每项含 `inputs`
+  （投入扫码）与 `outputs`（产出扫码），两者均可为空数组；`target_unit` 可选，仅接受
+  `"kg"` / `"lb"`，默认 `"kg"`。所有扫码既可以是元素串，也可以是 GS1 Digital Link
+  URI（与 `/parse` 完全一致）。
+- 每条扫码必须包含**恰好一个 AI 01**、**恰好一个 AI 10**（批号必填，批次由
+  GTIN + 批号共同标识）和**恰好一个重量 AI**（310n 或 320n，允许混合千克/磅）；
+  可有可无的 AI 17/21 会被忽略。任一条扫码解析失败或缺少/重复必需 AI，整个请求
+  返回 `422`：期初库存扫码以 `detail.stock_index` 定位，工序扫码以
+  `detail.process_index` + `detail.input_index` / `detail.output_index` 定位，
+  `detail.error` 为该条扫码的原始错误（结构同 `/parse`）。
+- 同一批次在同一工序内被重复扫码时按 **Decimal 精确累加**聚合（换算系数固定为
+  **1 lb = 0.45359237 kg**，千克→磅按其精确倒数换算），全程不使用 float。
+- 依赖图校验（任一失败都整单返回 `422`，`detail.process_index` 给出出错工序下标）：
+  - **一批多产**：同一批次被两道及以上工序产出，返回 `MULTIPLE_PRODUCERS`，
+    并附 `detail.first_index`（首次产出该批次的工序下标）；
+  - **引用无来源批次**：工序投入的批次既不在期初库存、也不由任何工序产出，
+    返回 `UNKNOWN_BATCH`；
+  - **循环**：生产/消耗依赖构成环（含工序消耗自身产出的自环），返回
+    `PROCESS_CYCLE`，`process_index` 为卷入环的最小工序下标。
+- 库存扣减：按**稳定拓扑序**（被依赖的工序先执行，并列时按请求中的工序下标
+  升序）逐工序执行——先扣投入、再补产出；任一步某批次**可用量不足**时整单返回
+  `422`，错误码 `INSUFFICIENT_STOCK`，`detail.process_index` 定位超耗工序。
+- 响应：`target_unit`、`processes` 与 `batches`。`processes` 按稳定拓扑序返回，
+  每项含 `process_index`（请求中的原始下标）、按批次聚合的 `inputs` / `outputs`
+  （批次内首次出现顺序）以及 `input_weight` / `output_weight` / `loss_weight`
+  （损耗 = 投入 − 产出，产出大于投入时为负）；`batches` 给出**全部批次**的最终
+  余量（期初库存批次按首次出现顺序在前，产出批次按执行顺序在后，耗尽的批次余量
+  为 `0.000000`）。所有重量全程 `Decimal` 计算，仅在响应时按**六位小数
+  half-even（银行家舍入）**输出为 JSON 数字（如 `5.000000`）。
+- `opening_stock` 与 `processes` 均为空数组时返回 `200`，`processes` 与 `batches`
+  均为空。
+
+请求示例（期初 `RAW` 10 kg；工序 0 消耗 `MID` 产出 `FIN`，工序 1 消耗 `RAW` 产出
+`MID`——请求顺序与依赖顺序相反，执行时工序 1 先运行）：
+
+```bash
+curl -X POST http://localhost:8080/batch-genealogy \
+  -H "Content-Type: application/json" \
+  -d '{"opening_stock": ["010950110153000310RAW\u001d3103010000"], "processes": [{"inputs": ["010950110153000310MID\u001d3103004000"], "outputs": ["010950110153000310FIN\u001d3103003800"]}, {"inputs": ["010950110153000310RAW\u001d3103005000"], "outputs": ["010950110153000310MID\u001d3103004000"]}]}'
+```
+
+响应 `200 OK`：工序 1（5 kg → 4 kg，损耗 1 kg）在工序 0（4 kg → 3.8 kg，损耗
+0.2 kg）之前执行；`RAW` 余 5 kg，`MID` 耗尽，`FIN` 余 3.8 kg：
+
+```json
+{
+  "target_unit": "kg",
+  "processes": [
+    {
+      "process_index": 1,
+      "inputs": [{"gtin": "09501101530003", "batch": "RAW", "weight": 5.000000}],
+      "outputs": [{"gtin": "09501101530003", "batch": "MID", "weight": 4.000000}],
+      "input_weight": 5.000000,
+      "output_weight": 4.000000,
+      "loss_weight": 1.000000
+    },
+    {
+      "process_index": 0,
+      "inputs": [{"gtin": "09501101530003", "batch": "MID", "weight": 4.000000}],
+      "outputs": [{"gtin": "09501101530003", "batch": "FIN", "weight": 3.800000}],
+      "input_weight": 4.000000,
+      "output_weight": 3.800000,
+      "loss_weight": 0.200000
+    }
+  ],
+  "batches": [
+    {"gtin": "09501101530003", "batch": "RAW", "remaining": 5.000000},
+    {"gtin": "09501101530003", "batch": "MID", "remaining": 0.000000},
+    {"gtin": "09501101530003", "batch": "FIN", "remaining": 3.800000}
+  ]
+}
+```
+
+依赖图错误示例——同一批次被两道工序产出，返回 `422`（当前下标与首次下标一并给出）：
+
+```json
+{
+  "detail": {
+    "process_index": 1,
+    "first_index": 0,
+    "error": {
+      "error": "MULTIPLE_PRODUCERS",
+      "message": "process 1: batch GTIN '09501101530003' batch 'X' is already produced by process 0; each batch may be produced by at most one process",
+      "expected": "each batch (GTIN + AI 10) to be produced by at most one process",
+      "found": "produced by processes 0 and 1"
+    }
+  }
+}
+```
+
+投入批次无来源（既不在期初库存也不由任何工序产出）：
+
+```json
+{
+  "detail": {
+    "process_index": 0,
+    "error": {
+      "error": "UNKNOWN_BATCH",
+      "message": "process 0: input batch GTIN '09501101530003' batch 'GHOST' has no source: it is neither in the opening stock nor produced by any process",
+      "expected": "every input batch to appear in the opening stock or in some process's outputs",
+      "found": "batch GTIN '09501101530003' batch 'GHOST' without a source"
+    }
+  }
+}
+```
+
+依赖成环（`process_index` 为卷入环的最小工序下标）：
+
+```json
+{
+  "detail": {
+    "process_index": 0,
+    "error": {
+      "error": "PROCESS_CYCLE",
+      "message": "process 0: production/consumption dependencies form a cycle among process(es) 0, 1",
+      "expected": "an acyclic production/consumption dependency graph",
+      "found": "cyclic dependencies among process(es) 0, 1"
+    }
+  }
+}
+```
+
+执行阶段超耗（期初 `RAW` 仅 3 kg，工序需要 5 kg）：
+
+```json
+{
+  "detail": {
+    "process_index": 0,
+    "error": {
+      "error": "INSUFFICIENT_STOCK",
+      "message": "process 0: input batch GTIN '09501101530003' batch 'RAW' requires 5.000000 kg but only 3.000000 kg is available",
+      "expected": "at most 3.000000 kg of batch GTIN '09501101530003' batch 'RAW'",
+      "found": "requested 5.000000 kg"
+    }
+  }
+}
+```
+
 ## 错误响应
 
 解析或校验失败返回 `422 Unprocessable Entity`，`detail` 中包含错误码、
@@ -745,18 +890,20 @@ uvicorn app.main:app --reload --port 8080
 
 ```
 app/
-  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan、/recall-impact、/trace-audit）
+  main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan、/recall-impact、/trace-audit、/batch-genealogy）
   gs1.py      # GS1 元素串 / Digital Link URI 解析与校验核心
   summary.py  # 多扫描重量汇总：Decimal 重建、单位换算、GTIN+批号分组
   pickplan.py # FEFO 拣货计划：GTIN+批号+效期汇总、as_of+min_remaining_days 效期门槛、按实际效期分配需求；whole 整包模式按单条扫描做最小超量子集选择
   recall.py   # 召回范围盘点：GTIN+序列号实物去重与冲突检测、有序规则（GTIN+批号集合+效期闭区间）首命中归组、未命中汇总
   traceaudit.py # 追溯事件审计：GTIN+序列号实物识别、批号/效期一致性校验、receive→pick→ship 状态机与异常记录、最终状态汇总
+  genealogy.py  # 生产批次谱系审计：GTIN+批号批次聚合、生产/消耗依赖图校验（一批多产/无来源/循环）、稳定拓扑序库存扣减、投入/产出/损耗与最终余量
 tests/
   test_parse.py
   test_weight_summary.py
   test_weight_pick_plan.py
   test_recall_impact.py
   test_trace_audit.py
+  test_batch_genealogy.py
 Dockerfile
 docker-compose.yml
 requirements.txt      # 运行依赖
